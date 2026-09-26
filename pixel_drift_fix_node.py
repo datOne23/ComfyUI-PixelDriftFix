@@ -25,8 +25,8 @@ class PixelDriftFixNode:
             },
         }
 
-    RETURN_TYPES = ("IMAGE", "MASK")
-    RETURN_NAMES = ("fixed_image", "mask")
+    RETURN_TYPES = ("IMAGE", "MASK", "IMAGE")
+    RETURN_NAMES = ("fixed_image", "mask", "fixed_rgb")
     FUNCTION = "fix_pixel_drift"
     CATEGORY = "image/processing"
 
@@ -38,6 +38,7 @@ class PixelDriftFixNode:
         batch_size = min(b1, b2)
         output_tensors = []
         mask_tensors = []
+        rgb_tensors = []
 
         for i in range(batch_size):
             # 1. Convert PyTorch tensor to uint8 BGR for OpenCV processing
@@ -82,8 +83,10 @@ class PixelDriftFixNode:
                 output_tensors.append(edited_image[i])
                 if edited_image[i].shape[-1] == 4:
                     mask_tensors.append(edited_image[i][:, :, 3].float())
+                    rgb_tensors.append(edited_image[i][:, :, :3])
                 else:
                     mask_tensors.append(torch.ones((height, width), dtype=torch.float32))
+                    rgb_tensors.append(edited_image[i])
                 continue
 
             # Match features
@@ -103,8 +106,10 @@ class PixelDriftFixNode:
                 output_tensors.append(edited_image[i])
                 if edited_image[i].shape[-1] == 4:
                     mask_tensors.append(edited_image[i][:, :, 3].float())
+                    rgb_tensors.append(edited_image[i][:, :, :3])
                 else:
                     mask_tensors.append(torch.ones((height, width), dtype=torch.float32))
+                    rgb_tensors.append(edited_image[i])
                 continue
 
             # Extract coordinates
@@ -119,8 +124,10 @@ class PixelDriftFixNode:
                 output_tensors.append(edited_image[i])
                 if edited_image[i].shape[-1] == 4:
                     mask_tensors.append(edited_image[i][:, :, 3].float())
+                    rgb_tensors.append(edited_image[i][:, :, :3])
                 else:
                     mask_tensors.append(torch.ones((height, width), dtype=torch.float32))
+                    rgb_tensors.append(edited_image[i])
                 continue
 
             inliers_mod = pts_mod[mask.ravel() == 1]
@@ -131,8 +138,10 @@ class PixelDriftFixNode:
                 output_tensors.append(edited_image[i])
                 if edited_image[i].shape[-1] == 4:
                     mask_tensors.append(edited_image[i][:, :, 3].float())
+                    rgb_tensors.append(edited_image[i][:, :, :3])
                 else:
                     mask_tensors.append(torch.ones((height, width), dtype=torch.float32))
+                    rgb_tensors.append(edited_image[i])
                 continue
 
             # Calculate Global Layer (always needed either as final output or as mesh fallback boundary)
@@ -221,19 +230,24 @@ class PixelDriftFixNode:
             # 2. Convert final BGR image back to RGB and then normalize PyTorch Tensor [H, W, C]
             final_rgb = cv2.cvtColor(final_img, cv2.COLOR_BGR2RGB)
 
+            # fixed_rgb is always the 3-channel RGB result (no alpha), like a JPEG output
+            fixed_rgb_tensor = torch.from_numpy(final_rgb).float() / 255.0
+
             if alpha_mod is not None:
                 # final_alpha was set above; recombine into 4-channel RGBA
                 final_rgb = np.dstack([final_rgb, final_alpha])
                 out_tensor = torch.from_numpy(final_rgb).float() / 255.0
                 mask_tensor = torch.from_numpy(final_alpha).float() / 255.0
             else:
-                out_tensor = torch.from_numpy(final_rgb).float() / 255.0
+                out_tensor = fixed_rgb_tensor
                 mask_tensor = torch.ones((height, width), dtype=torch.float32)
 
             output_tensors.append(out_tensor)
             mask_tensors.append(mask_tensor)
+            rgb_tensors.append(fixed_rgb_tensor)
 
         # Stack separate batch images back into uniform [B, H, W, C] format
         fixed_image_batch = torch.stack(output_tensors, dim=0)
         mask_batch = torch.stack(mask_tensors, dim=0)
-        return (fixed_image_batch, mask_batch)
+        fixed_rgb_batch = torch.stack(rgb_tensors, dim=0)
+        return (fixed_image_batch, mask_batch, fixed_rgb_batch)
