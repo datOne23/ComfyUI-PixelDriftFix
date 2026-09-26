@@ -4,6 +4,8 @@ A ComfyUI custom node designed to eliminate pixel drifting, stretching, and mino
 
 ## Features
 * **Perfect Alignment:** Fixes framing changes introduced by complex image-to-image or upscaling workflows.
+* **Alpha channel support:** Preserves and warps the alpha channel from the edited image.
+* **MASK output:** Outputs the alpha channel (or a fully-opaque mask) for compositing.
 * **Dual Alignment Modes:**
   * `flat_4_points`: (recommended) A lightning-fast global perspective transform using homography matrices with 4 points (Best for most use cases, ~4s processing).
   * `mesh`: (experimental, worse and slow) A dense, non-linear piecewise affine warping mesh for complex local deformations, uses 100-10000 points.

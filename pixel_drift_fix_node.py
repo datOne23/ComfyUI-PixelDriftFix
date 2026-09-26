@@ -25,8 +25,8 @@ class PixelDriftFixNode:
             },
         }
 
-    RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("fixed_image",)
+    RETURN_TYPES = ("IMAGE", "MASK")
+    RETURN_NAMES = ("fixed_image", "mask")
     FUNCTION = "fix_pixel_drift"
     CATEGORY = "image/processing"
 
@@ -37,14 +37,26 @@ class PixelDriftFixNode:
         
         batch_size = min(b1, b2)
         output_tensors = []
+        mask_tensors = []
 
         for i in range(batch_size):
             # 1. Convert PyTorch tensor to uint8 BGR for OpenCV processing
             img_orig_rgb = (source_image[i].cpu().numpy() * 255).astype(np.uint8)
             img_mod_rgb = (edited_image[i].cpu().numpy() * 255).astype(np.uint8)
-            
-            img_orig = cv2.cvtColor(img_orig_rgb, cv2.COLOR_RGB2BGR)
-            img_mod = cv2.cvtColor(img_mod_rgb, cv2.COLOR_RGB2BGR)
+
+            # Warn on channel mismatch between source and edited
+            if img_orig_rgb.shape[-1] != img_mod_rgb.shape[-1]:
+                print(f"[PixelDriftFix] Warning: source ({img_orig_rgb.shape[-1]}ch) and edited ({img_mod_rgb.shape[-1]}ch) channel counts differ in batch {i}.")
+
+            # Extract alpha from edited image only (alpha is an output channel; source alpha is only an alignment reference)
+            alpha_mod = img_mod_rgb[:, :, 3] if img_mod_rgb.shape[-1] == 4 else None
+
+            # Use only RGB for OpenCV processing (cvtColor requires 3 channels)
+            img_orig_rgb3 = img_orig_rgb[:, :, :3]
+            img_mod_rgb3 = img_mod_rgb[:, :, :3]
+
+            img_orig = cv2.cvtColor(img_orig_rgb3, cv2.COLOR_RGB2BGR)
+            img_mod = cv2.cvtColor(img_mod_rgb3, cv2.COLOR_RGB2BGR)
             
             height, width = img_orig.shape[:2]
             
@@ -68,6 +80,10 @@ class PixelDriftFixNode:
             if des_orig is None or des_mod is None or len(kp_orig) < 10 or len(kp_mod) < 10:
                 print(f"[PixelDriftFix] Warning: Not enough features found in batch {i}. Passing edited image through.")
                 output_tensors.append(edited_image[i])
+                if edited_image[i].shape[-1] == 4:
+                    mask_tensors.append(edited_image[i][:, :, 3].float())
+                else:
+                    mask_tensors.append(torch.ones((height, width), dtype=torch.float32))
                 continue
 
             # Match features
@@ -85,6 +101,10 @@ class PixelDriftFixNode:
             if len(good_matches) < 10:
                 print(f"[PixelDriftFix] Warning: Too few good matches ({len(good_matches)}) in batch {i}. Passing edited image through.")
                 output_tensors.append(edited_image[i])
+                if edited_image[i].shape[-1] == 4:
+                    mask_tensors.append(edited_image[i][:, :, 3].float())
+                else:
+                    mask_tensors.append(torch.ones((height, width), dtype=torch.float32))
                 continue
 
             # Extract coordinates
@@ -97,6 +117,10 @@ class PixelDriftFixNode:
             if M is None or mask is None:
                 print(f"[PixelDriftFix] Warning: Homography matrix computation failed in batch {i}.")
                 output_tensors.append(edited_image[i])
+                if edited_image[i].shape[-1] == 4:
+                    mask_tensors.append(edited_image[i][:, :, 3].float())
+                else:
+                    mask_tensors.append(torch.ones((height, width), dtype=torch.float32))
                 continue
 
             inliers_mod = pts_mod[mask.ravel() == 1]
@@ -105,12 +129,31 @@ class PixelDriftFixNode:
             if len(inliers_mod) < 10:
                 print(f"[PixelDriftFix] Warning: Too few static features ({len(inliers_mod)}) found after RANSAC filtering. Images should be similar.")
                 output_tensors.append(edited_image[i])
+                if edited_image[i].shape[-1] == 4:
+                    mask_tensors.append(edited_image[i][:, :, 3].float())
+                else:
+                    mask_tensors.append(torch.ones((height, width), dtype=torch.float32))
                 continue
 
             # Calculate Global Layer (always needed either as final output or as mesh fallback boundary)
             global_warped = cv2.warpPerspective(
                 img_mod, M, (width, height), borderMode=cv2.BORDER_REPLICATE
             )
+
+            # Warp the alpha channel through the same homography.
+            # Transparent borders (borderValue=0) correctly signal extrapolated regions.
+            if alpha_mod is not None:
+                global_warped_alpha = cv2.warpPerspective(
+                    alpha_mod, M, (width, height),
+                    flags=cv2.INTER_LINEAR,
+                    borderMode=cv2.BORDER_CONSTANT,
+                    borderValue=0,
+                )
+            else:
+                global_warped_alpha = None
+
+            # final_alpha defaults to the global alpha (flat_4_points result and mesh fallback)
+            final_alpha = global_warped_alpha
 
             # Route calculation based on selected UI dropdown method
             if method == "mesh":
@@ -158,9 +201,18 @@ class PixelDriftFixNode:
                     valid_mesh_mask = coverage_warped > 0.5
                     
                     final_img = np.where(valid_mesh_mask[:, :, None], local_warped, global_warped)
+
+                    # Warp alpha through the piecewise affine transform (transparent borders).
+                    # valid_mesh_mask is 2D; keep alpha 2D to match ComfyUI MASK [B, H, W] convention.
+                    if alpha_mod is not None:
+                        alpha_float = alpha_mod.astype(np.float32) / 255.0
+                        local_warped_alpha = warp(alpha_float, tform, output_shape=(height, width), order=1, mode='constant', cval=0)
+                        local_warped_alpha = (local_warped_alpha * 255).astype(np.uint8)
+                        final_alpha = np.where(valid_mesh_mask, local_warped_alpha, global_warped_alpha)
                 except Exception as warp_error:
                     print(f"[PixelDriftFix] Error during dense warping: {warp_error}. Falling back to linear matrix transform.")
                     final_img = global_warped
+                    final_alpha = global_warped_alpha
             else:
                 # Default "flat_4_points" path: clean global warp matrix execution
                 print("PixelDriftFix: using flat_4_points")
@@ -168,9 +220,20 @@ class PixelDriftFixNode:
 
             # 2. Convert final BGR image back to RGB and then normalize PyTorch Tensor [H, W, C]
             final_rgb = cv2.cvtColor(final_img, cv2.COLOR_BGR2RGB)
-            out_tensor = torch.from_numpy(final_rgb).float() / 255.0
+
+            if alpha_mod is not None:
+                # final_alpha was set above; recombine into 4-channel RGBA
+                final_rgb = np.dstack([final_rgb, final_alpha])
+                out_tensor = torch.from_numpy(final_rgb).float() / 255.0
+                mask_tensor = torch.from_numpy(final_alpha).float() / 255.0
+            else:
+                out_tensor = torch.from_numpy(final_rgb).float() / 255.0
+                mask_tensor = torch.ones((height, width), dtype=torch.float32)
+
             output_tensors.append(out_tensor)
+            mask_tensors.append(mask_tensor)
 
         # Stack separate batch images back into uniform [B, H, W, C] format
         fixed_image_batch = torch.stack(output_tensors, dim=0)
-        return (fixed_image_batch,)
+        mask_batch = torch.stack(mask_tensors, dim=0)
+        return (fixed_image_batch, mask_batch)
